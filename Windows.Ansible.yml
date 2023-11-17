@@ -1,0 +1,40 @@
+- name: "Windows Join Domain"
+  hosts: all
+  gather_facts: no
+  become: true
+  become_method: runas
+  become_user: "administrator"
+  tasks:
+    - name: change hostname
+      ansible.windows.win_hostname:
+        name: "{{ instancename }}"
+      register: res
+
+    - name: add active directory Module
+      win_shell: |
+        Install-WindowsFeature -Name "RSAT-AD-PowerShell" -IncludeAllSubFeature
+
+    - name: reboot 1
+      ansible.windows.win_reboot:
+      when: res.reboot_required
+    
+    - name: "Join Domain"
+      win_domain_membership:
+        dns_domain_name: crb.local
+        domain_admin_user: svc_ansibleserver_automation@crb.local
+        domain_admin_password: "{{ domain_user_pass }}"
+        domain_ou_path: "OU=CRB Workstations,DC=crb,DC=local"
+        state: domain
+      register: domain_state
+
+    - win_reboot:
+      when: domain_state.reboot_required
+
+    - name: moving the computer object to the relevant OU
+      ansible.windows.win_shell: |
+        $password = ConvertTo-SecureString '{{ domain_user_pass }}' -AsPlainText -Force
+        $cred = New-Object System.Management.Automation.PSCredential ("svc_ansibleserver_automation@crb.local",$password)
+        $name = $env:COMPUTERNAME
+        Import-Module *ActiveDirectory*
+        Move-ADObject -Identity "CN=$($name),OU=CRB Workstations,DC=crb,DC=local" -TargetPath "OU=CVM,OU=CRB Workstations,DC=crb,DC=local" -Server "CRB08.crb.local" -Credential $cred
+        Add-LocalGroupMember -Group "Administrators" -Member '{{ username }}'

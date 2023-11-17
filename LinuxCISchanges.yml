@@ -1,0 +1,53 @@
+---
+- name: Cis Standard post installation configuration
+  hosts: all
+  gather_facts: no
+  become: yes
+  become_method: sudo
+
+  tasks:
+    - name: change 14394,14395,14397 ipv6 routing
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.d/cis_sysctl.conf
+        insertafter: fs.suid.dumpable = 0
+        line: net.ipv6.conf.default.accept_source_route = 0
+
+    - name: change 10663 NTP server preference
+      ansible.builtin.lineinfile:
+        path: /etc/chrony.d/ntp-pool.sources
+        insertafter: pool 2.amazon.pool.ntp.org iburst maxsources 2
+        line: "{{ item }}"
+      with_items:
+      - 'server crb08.crblocal prefer'
+      - 'server crb09.crblocal prefer'
+    
+    - name: change 10664 switch out line in /etc/sysconfig/chronyd
+      ansible.builtin.lineinfile:
+        path: /etc/sysconfig/chronyd
+        regexp: 'OPTIONS="-F 2"'
+        line: 'OPTIONS="-u chrony"'
+    
+    - name: change 5222 switch out line in /etc/ssh/sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "ClientAliveInterval 900"
+        line: "ClientAliveInterval 60"
+
+    - name: change /etc/fstab file for /media
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        insertbefore: '# Added by CIS Linux Build Kit'
+        line: /media ext4 defaults,noexec,nodev 0 0
+
+    - name: change /etc/fstab file for /home
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        insertbefore: /media ext4 defaults,noexec,nodev 0 0
+        line: /home ext4 defaults,noexec 0 0
+
+    - name: change the /etc/fstab /tmp noexec command for vsc
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^tmpfs\s+/tmp\s+tmpfs\s+'
+        line: 'tmpfs   /tmp    tmpfs   defaults,nosuid,nodev 0   0'
+        state: present

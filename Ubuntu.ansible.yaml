@@ -1,0 +1,230 @@
+---
+- name: Install and configure AD authentication
+  hosts: all
+  gather_facts: no
+  become: yes
+  become_user: root
+  become_method: sudo
+
+  tasks:
+    - name: Update and upgrade apt packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+        cache_valid_time: 86400 #One day
+
+    - name: Install the required packages
+      apt:
+        name: realmd,sssd,sssd-tools,adcli,samba-common-bin,python3-pip,cifs-utils,libnss-sss,libpam-sss,packagekit,unzip
+        state: present
+      
+    - name: Unconditionally reboot the machine with all defaults
+      ansible.builtin.reboot:
+
+    - name: setting hostname
+      hostname:
+        name: "{{ instancename }}"
+
+    - name: Set timezone to NewYork
+      ansible.builtin.shell: timedatectl set-timezone America/New_York
+
+    - name: Fix resolv.conf symlink
+      ansible.builtin.shell: |
+        sudo rm -f /etc/resolv.conf
+        sudo ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
+
+    - name: Creating /etc/krb5.conf
+      file:
+        path: "/etc/krb5.conf"
+        state: touch
+    
+    - name: add content to the krb5 file
+      blockinfile:
+        path: "/etc/krb5.conf"
+        block: |
+          [libdefaults]
+          dns_lookup_realm = false
+          ticket_lifetime = 24h
+          renew_lifetime = 7d
+          forwardable = true
+          rdns = false
+          # default_realm = EXAMPLE.COM
+          default_ccache_name = KEYRING:persistent:%{uid}
+    
+    - name: join system to ad
+      expect:
+        command: "sudo realm join crb.local --computer-ou='OU=CVM,OU=CRB Workstations,DC=crb,DC=local' -U 'svc_ansibleserver_automation@CRB.LOCAL'"
+        responses:
+          Password for *: "{{ domain_user_pass }}"
+
+    - name: fix mkhomedir issue
+      shell: pam-auth-update --enable mkhomedir
+
+    - name: Copy sssd.conf file from ansible server to dest server
+      copy:
+        src: '{{ working_directory }}/Files/sssd.conf'
+        dest: /etc/sssd/sssd.conf
+      notify:
+        - restart sssd
+
+    - name: Copy sudoers.d file from ansible server to dest server
+      copy:
+        src: '{{ working_directory }}/Files/00-local-admin-rule'
+        dest: /etc/sudoers.d/00-local-admin-rule
+      notify:
+        - restart sssd
+
+    - name: Copy sshd_config file from ansible server to dest server
+      copy:
+        src: '{{ working_directory }}/Files/sshd_config'
+        dest: /etc/ssh/sshd_config
+      notify:
+        - restart sshd
+      
+    - name: Insert username into sudoers rule file
+      ansible.builtin.lineinfile:
+        path: /etc/sudoers.d/00-local-admin-rule
+        insertafter: '"%secaws_ec2" ALL=(ALL) NOPASSWD:ALL'
+        line: '{{ username }} ALL=(ALL) NOPASSWD:ALL'
+
+    - name: create directory for CIS-Standard
+      ansible.builtin.file:
+        path: /etc/CIS-Standard
+        state: directory
+        mode: '0755'
+
+    - name: Copy CIS tar file
+      copy:
+        src: '{{ working_directory }}/Files/cis_lbk_ubuntu_linux_22.04_lts.tar.gz'
+        dest: /etc/CIS-Standard/cis_lbk_ubuntu_linux_22.04_lts.tar.gz
+
+    - name: open CIS tar file
+      ansible.builtin.unarchive:
+        src: /etc/CIS-Standard/cis_lbk_ubuntu_linux_22.04_lts.tar.gz
+        dest: /etc/CIS-Standard
+        remote_src: yes
+
+    - name: Add exclusion
+      lineinfile:
+        path: /etc/CIS-Standard/CIS-LBK/ubuntu_linux_22.04_lts/exclusion_list.txt
+        insertafter: '# 2.2.2 # Elclude recommendation 2.2.2 - Ensure X Window System is not installed'
+        line: |
+          '1.6.1.1 # exclude apparmor
+          1.6.1.2 # exclude apparmor
+          1.6.1.3 # exclude apparmor
+          1.6.1.4 # exclude apparmor profile enforcement, task always fails'
+
+    - name: install CIS-Standard
+      expect:
+        command: sudo /etc/CIS-Standard/CIS-LBK/ubuntu_linux_22.04_lts/cis-lbk_ubuntu_22.04_LTS-v1.0.0.sh
+        responses:
+          'Do you want to continue\? y/n \[n\]:': "y"
+          'Profile:': "3"
+          'Which services should be restarted\?': "15"
+        timeout: 360
+
+    #add local user crbadmin as sudo with ssh keys
+    - name: Create a user
+      user:
+        name: crbadmin
+        state: present
+        createhome: yes
+        shell: /bin/bash
+
+    - name: Add public key
+      authorized_key:
+        user: crbadmin
+        state: present
+        key: "{{ crbadmin_public_ssh_key }}"
+
+    - name: add crbadmin to sudoers
+      lineinfile:
+        dest: /etc/sudoers.d/00-local-admin-rule
+        insertafter: '"secaws_ec2" ALL=(ALL) NOPASSWD:ALL'
+        line: "crbadmin ALL=(ALL) NOPASSWD:ALL"
+        validate: visudo -cf %s
+        state: present
+
+      #install Tanium agent
+    - name: Create Tanium directory
+      file:
+        path: /opt/tanium
+        state: directory
+
+    - name: Copy Zip file
+      copy:
+        src: '{{ working_directory }}/Files/linux-client-bundle.zip'
+        dest: /opt/tanium/linux-client-bundle
+
+    - name: Unzip the file
+      unarchive:
+        src: /opt/tanium/linux-client-bundle
+        dest: /opt/tanium/
+        remote_src: yes
+
+    - name: run the rpm file
+      apt:
+        deb: /opt/tanium/taniumclient_7.4.10.1034-ubuntu22_amd64.deb
+      become: true
+
+    - name: move the dat file
+      copy:
+        src: /opt/tanium/tanium-init.dat
+        dest: /opt/Tanium/TaniumClient/
+        remote_src: yes
+
+    - name: run configuration for agent
+      shell: |
+        /opt/Tanium/TaniumClient/TaniumClient config set ServerName crossriver.cloud.tanium.com
+
+    - name: start tanium service
+      service:
+        name: taniumclient.service
+        state: started
+
+    #restart sshd
+    - name: restart sshd service
+      ansible.builtin.systemd:
+        state: restarted
+        daemon_reload: yes
+        name: sshd
+
+    - name: make agents directory
+      file:
+        path: /etc/agents
+        state: directory
+
+    - name: copy agent directory content
+      copy:
+        src: "{{ item }}"
+        dest: /etc/agents/
+        mode: 755
+      with_fileglob:
+        - '{{ working_directory }}/agents/*'
+    
+    - name: installing Agents
+      shell: |
+        sudo DEBIAN_FRONTEND=noninteractive AWN_CUSTOMER_JSON=/etc/agents/customer.json apt install /etc/agents/arcticwolfagent-2022.03.52-1.x86_64.deb -y
+        sudo dpkg -i /etc/agents/falcon-sensor_7.02.0-15705_amd64.deb
+        sudo /opt/CrowdStrike/falconctl -s --cid=A7FBB41C04E74C8685AF5AA0A051736A-D5
+        sudo systemctl start falcon-sensor
+        sudo dpkg --install /etc/agents/QualysCloudAgent.deb
+        sudo /usr/local/qualys/cloud-agent/bin/qualys-cloud-agent.sh ActivationId=c57f6759-aa85-447b-b088-39456001dd42 CustomerId=2f2df9f3-b9cf-fccb-83ed-778fb67715a2
+
+      #restart handlers
+  handlers:
+    - name: restart realmd
+      service:
+        name: realmd
+        state: restarted
+
+    - name: restart sssd
+      service:
+        name: sssd
+        state: restarted
+
+    - name: restart sshd
+      service:
+        name: sshd
+        state: restarted
+        

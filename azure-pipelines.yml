@@ -1,0 +1,252 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- master
+
+parameters:
+- name: pipelineparam1
+  displayName: Client User Name
+  type: string
+- name: pipelineparam2
+  displayName: Operating System
+  values:
+  - Windows Server 2022
+  - Amazon Linux 2
+  - Ubuntu 22.04 LTS
+- name: pipelineparam4
+  displayName: Machine Type
+  type: string
+  values:
+    - Dev Machine
+    - Admin Machine
+
+variables: 
+- name: KeyPair
+  ${{ if eq( parameters['pipelineparam4'], 'Dev Machine') }}:
+    value: CVM-LVM
+  ${{ if eq( parameters['pipelineparam4'], 'Admin Machine') }}:
+    value: CVM-LVM-SupportTeam
+- name: MachineType
+  ${{ if eq( parameters['pipelineparam4'], 'Dev Machine') }}:
+    value: 'true'
+  ${{ if eq( parameters['pipelineparam4'], 'Admin Machine') }}:
+    value: 'false'
+- name: ServiceConnection
+  ${{ if eq( parameters['pipelineparam4'], 'Dev Machine') }}:
+    value: CVM-LVM-Automation
+  ${{ if eq( parameters['pipelineparam4'], 'Admin Machine') }}:
+    value: CVM-LVM-Terraform-Auto-SupportTeam
+- name: Windows_Machine
+  ${{ if eq( parameters['pipelineparam2'], 'Windows Server 2022') }}:
+    value: true
+  ${{ if eq( parameters['pipelineparam2'], 'Amazon Linux 2') }}:
+    value: false
+  ${{ if eq( parameters['pipelineparam2'], 'Ubuntu 22.04 LTS') }}:
+    value: false
+- name: Linux_Machine
+  ${{ if eq( parameters['pipelineparam2'], 'Amazon Linux 2') }}:
+    value: true
+  ${{ if eq( parameters['pipelineparam2'], 'Ubuntu 22.04 LTS') }}:
+    value: true
+  ${{ if eq( parameters['pipelineparam2'], 'Windows Server 2022') }}:
+    value: false
+- name: AMI
+  ${{ if eq( parameters['pipelineparam2'], 'Windows Server 2022') }}:
+    value: ami-0fc682b2a42e57ca2
+  ${{ if eq( parameters['pipelineparam2'], 'Amazon Linux 2') }}:
+    value: ami-06a0cd9728546d178
+  ${{ if eq( parameters['pipelineparam2'], 'Ubuntu 22.04 LTS') }}:
+    value: ami-053b0d53c279acc90
+- group: CVM-LVM user credentials
+
+
+pool:
+  name: Ansible-Terraform Pool
+
+stages:
+  - stage: running_Terraform
+    jobs:
+      - job: provisioning_CVM_or_LVM
+        continueOnError: 'false'
+        steps:
+          - task: DownloadSecureFile@1
+            displayName: 'Download CVM-LVM'
+            inputs:
+              secureFile: 'CVM-LVM'
+          
+          - task: DownloadSecureFile@1
+            displayName: 'Download CVM-LVM-SupportTeam'
+            inputs:
+              secureFile: 'CVM-LVM-SupportTeam'
+
+          - task: DownloadSecureFile@1
+            displayName: 'Download Duovarfile'
+            inputs:
+              secureFile: 'Duovarfile'
+
+          - task: DownloadSecureFile@1
+            displayName: 'Download pam_duo'
+            inputs:
+              secureFile: 'pam_duo'
+
+          - task: DownloadSecureFile@1
+            displayName: 'Download password-auth'
+            inputs:
+              secureFile: 'password-auth'
+
+          - task: DownloadSecureFile@1
+            displayName: 'Download sshd'
+            inputs:
+              secureFile: 'sshd'
+
+          - task: DownloadSecureFile@1
+            displayName: 'Download system-auth'
+            inputs:
+              secureFile: 'system-auth'
+
+          - task: Powershell@2
+            displayName: add user to AD group
+            inputs:
+              targetType: 'inline'
+              script: |
+                $groupmembership = getent group secaws_ec2
+                if($groupmembership -notlike '*${{parameters.pipelineparam1}}*')
+                {
+                  '$(svc_ansibleserver_automation)' | adcli add-member --domain=crb.local secAWS_EC2 ${{parameters.pipelineparam1}} --login-user=svc_ansibleserver_automation --stdin-password
+                }
+                else
+                {
+                  write-host "User already in group"
+                }
+                sudo sss_cache -G
+
+          - task: TerraformTaskV1@0
+            displayName: Terraform init
+            inputs:
+              provider: 'aws'
+              command: 'init'
+              backendServiceAWS: 'CVM-LVM-Automation'
+              backendAWSBucketName: 'arn:aws:s3:::cvm-lvm-automation'
+              backendAWSKey: '/'
+      
+          - task: TerraformTaskV3@3
+            displayName: Terraform apply
+            inputs:
+              provider: 'aws'
+              command: 'apply'
+              commandOptions: '-var temp_directory="$(Agent.TempDirectory)" -var working_directory="$(System.DefaultWorkingDirectory)" -var instance_name="${{ parameters.pipelineparam1 }}" -var LinuxMachine=${{ variables.Linux_Machine }} -var WindowsMachine=${{ variables.Windows_Machine }} -var MachineType=${{variables.MachineType}} -var AMI=${{variables.AMI}} -lock=false'
+              environmentServiceNameAWS: '${{variables.ServiceConnection}}'
+
+          #capture the output variable from the terraform script by looking into the tfstate
+          - task: terraform-outputs@0
+            inputs:
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+              setPipelineVariables: true
+              maskOutputVariables: true
+
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                chmod 600 $(Agent.TempDirectory)/CVM-LVM
+                chmod 600 $(Agent.TempDirectory)/CVM-LVM-SupportTeam
+                sleep 15
+
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                sleep 90
+            condition: eq('${{ variables.Windows_Machine }}', 'true')
+
+          #first is a ansible task for the linux machines
+          - task: Ansible@0
+            inputs:
+              ansibleInterface: 'agentMachine'
+              playbookPathOnAgentMachine: 'Linux.ansible.yml'
+              inventoriesAgentMachine: 'hostList'
+              inventoryHostListAgentMachine: '$(PrivateIP)'
+              sudoEnabled: true
+              sudoUser: 'root'
+              args: >
+                --key-file $(Agent.TempDirectory)/${{variables.KeyPair}}
+                -e 
+                'instancename=$(LVMname).crb.local
+                domain_user_pass="$(svc_ansibleserver_automation)"
+                username=$(UserName)
+                ansible_user=ec2-user
+                working_directory=$(System.DefaultWorkingDirectory)
+                ansible_winrm_server_cert_validation=ignore
+                ansible_python_warning=ignore
+                crbadmin_public_ssh_key="$(crbadmin_public_ssh_key)"'
+            retryCountOnTaskFailure: 3
+            displayName: 'Run Amazon Linux 2 Playbook'
+            condition: eq('${{ parameters.pipelineparam2 }}', 'Amazon Linux 2')
+
+          #CIS changes
+          - task: Ansible@0
+            inputs:
+              ansibleInterface: 'agentMachine'
+              playbookPathOnAgentMachine: 'LinuxCISchanges.yml'
+              inventoriesAgentMachine: 'hostList'
+              inventoryHostListAgentMachine: '$(PrivateIP)'
+              sudoEnabled: true
+              sudoUser: 'root'
+              args: >
+                --key-file $(Agent.TempDirectory)/${{variables.KeyPair}}
+                -e
+                "ansible_user=ec2-user
+                 ansible_winrm_server_cert_validation=ignore
+                 ansible_python_warning=ignore"
+            displayName: 'Run CIS configuration'
+            condition: eq('${{ parameters.pipelineparam2 }}', 'Amazon Linux 2')
+          
+          - task: Ansible@0
+            inputs:
+              ansibleInterface: 'agentMachine'
+              playbookPathOnAgentMachine: 'Ubuntu.ansible.yaml'
+              inventoriesAgentMachine: 'hostList'
+              inventoryHostListAgentMachine: '$(PrivateIP)'
+              sudoEnabled: true
+              sudoUser: 'root'
+              args: >
+                --key-file $(Agent.TempDirectory)/${{variables.KeyPair}}
+                -e 
+                'instancename=$(LVMname).crb.local
+                domain_user_pass="$(svc_ansibleserver_automation)"
+                crbadmin_public_ssh_key="$(crbadmin_public_ssh_key)"
+                username=$(UserName)
+                ansible_user=ubuntu
+                working_directory=$(System.DefaultWorkingDirectory)
+                ansible_winrm_server_cert_validation=ignore
+                ansible_python_warning=ignore'
+            displayName: 'Run Ubuntu Playbook'
+            condition: eq('${{ parameters.pipelineparam2 }}', 'Ubuntu 22.04 LTS')
+
+          #ansible task for windows machines
+          - task: Ansible@0
+            inputs:
+              ansibleInterface: 'agentMachine'
+              playbookPathOnAgentMachine: 'Windows.Ansible.yml'
+              inventoriesAgentMachine: 'hostList'
+              inventoryHostListAgentMachine: '$(PrivateIP)'
+              args: >
+               -e 'instancename=$(CVMname)
+                    username=$(UserName)
+                    domain_user_pass="$(svc_ansibleserver_automation)"
+                    ansible_user=administrator
+                    ansible_password=$(AdminPass)
+                    ansible_connection=winrm
+                    ansible_winrm_server_cert_validation=ignore
+                    ansible_winrm_transport=ntlm
+                    ansible_port=5986
+                    ansible_python_warning=ignore'
+              sudoEnabled: true
+            displayName: 'Run Windows Playbook'
+            retryCountOnTaskFailure: 5
+            condition: eq('${{ variables.Windows_Machine }}', 'true')
+
+
