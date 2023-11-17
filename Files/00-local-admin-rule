@@ -1,0 +1,4 @@
+"%domain admins"  ALL=(ALL)       NOPASSWD:ALL
+"%secitops"  ALL=(ALL)     NOPASSWD:ALL
+"secaws_ec2" ALL=(ALL) NOPASSWD:ALL
+
