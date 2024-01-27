@@ -1,8 +1,3 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
-
 trigger:
 - master
 
@@ -55,7 +50,7 @@ variables:
     value: false
 - name: AMI
   ${{ if eq( parameters['pipelineparam2'], 'Windows Server 2022') }}:
-    value: ami-0fc682b2a42e57ca2
+    value: ami-0cd601a22ac9e6d79
   ${{ if eq( parameters['pipelineparam2'], 'Amazon Linux 2') }}:
     value: ami-06a0cd9728546d178
   ${{ if eq( parameters['pipelineparam2'], 'Ubuntu 22.04 LTS') }}:
@@ -63,14 +58,28 @@ variables:
 - group: CVM-LVM user credentials
 
 
-pool:
-  name: Ansible-Terraform Pool
+# pool:
+#   name: Ansible-Terraform Pool
 
 stages:
   - stage: running_Terraform
     jobs:
+      - job: provision_ECS_Container
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: AWSCLI@1
+            inputs:
+              awsCredentials: 'CVM-LVM-ECS-Creation'
+              regionName: 'us-east-1'
+              awsCommand: 'ecs'
+              awsSubCommand: 'run-task'
+              awsArguments: '--cluster infrastructure_prod_cluster --launch-type FARGATE --network-configuration awsvpcConfiguration={subnets=["subnet-0d50e287ffa2ac044","subnet-09ff541150c0b2116"],securityGroups=["sg-07105dcf7df6466f8","sg-09fabacb8a80555ad","sg-0f635e54a71fddcf9"],assignPublicIp="DISABLED"} --task-definition Azure-Pipeline-Agent:27 --count 1'
+
       - job: provisioning_CVM_or_LVM
+        pool: 'Ansible-Terraform Pool'
         continueOnError: 'false'
+        dependsOn: provision_ECS_Container
         steps:
           - task: DownloadSecureFile@1
             displayName: 'Download CVM-LVM'
@@ -106,22 +115,20 @@ stages:
             displayName: 'Download system-auth'
             inputs:
               secureFile: 'system-auth'
-
-          - task: Powershell@2
-            displayName: add user to AD group
+          
+          - task: CmdLine@2
+            displayName: Install Python Packages
             inputs:
-              targetType: 'inline'
-              script: |
-                $groupmembership = getent group secaws_ec2
-                if($groupmembership -notlike '*${{parameters.pipelineparam1}}*')
-                {
-                  '$(svc_ansibleserver_automation)' | adcli add-member --domain=crb.local secAWS_EC2 ${{parameters.pipelineparam1}} --login-user=svc_ansibleserver_automation --stdin-password
-                }
-                else
-                {
-                  write-host "User already in group"
-                }
-                sudo sss_cache -G
+              script: pip install ldap3 pycryptodome
+
+          - task: PythonScript@0
+            displayName: Running python AD group check
+            inputs:
+              scriptSource: 'filePath'
+              scriptPath: '$(System.DefaultWorkingDirectory)/group membership auto.py'
+              arguments: '${{ parameters.pipelineparam1 }} $(svc_ansibleserver_automation)'
+              pythonInterpreter: '/usr/bin/python3'
+
 
           - task: TerraformTaskV1@0
             displayName: Terraform init
@@ -223,6 +230,7 @@ stages:
                 working_directory=$(System.DefaultWorkingDirectory)
                 ansible_winrm_server_cert_validation=ignore
                 ansible_python_warning=ignore'
+            retryCountOnTaskFailure: 3
             displayName: 'Run Ubuntu Playbook'
             condition: eq('${{ parameters.pipelineparam2 }}', 'Ubuntu 22.04 LTS')
 
